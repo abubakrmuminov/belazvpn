@@ -349,6 +349,9 @@ async def admin_commands_help(message: types.Message, db_user: User, db: AsyncSe
 • <code>/clear_rules</code> - очистить все правила
 • <code>/rules_stats</code> - статистика правил
 
+<b>🎨 Управление эмодзи:</b>
+• <code>/parse_emoji [название]</code> - получить JSON с ID эмодзи из пака (например: <code>/parse_emoji ClassicEmoji</code>)
+
 <b>ℹ️ Справка:</b>
 • <code>/admin_help</code> - это сообщение
 
@@ -360,6 +363,66 @@ async def admin_commands_help(message: types.Message, db_user: User, db: AsyncSe
 """
 
     await message.reply(help_text)
+
+
+@admin_required
+@error_handler
+async def parse_emoji_command(message: types.Message, db_user: User, db: AsyncSession):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply(
+            "❌ <b>Укажите название набора эмодзи</b>\n\n"
+            "Пример: <code>/parse_emoji ClassicEmoji</code>\n"
+            "Название можно взять из публичной ссылки на пак: t.me/addemoji/<b>ClassicEmoji</b>"
+        )
+        return
+
+    pack_name = args[1].strip()
+    status_msg = await message.reply("🔄 <i>Загружаю информацию о паке эмодзи...</i>")
+
+    try:
+        sticker_set = await message.bot.get_sticker_set(pack_name)
+        if not sticker_set or not sticker_set.stickers:
+            await status_msg.edit_text("❌ Набор пуст или не найден.")
+            return
+
+        emoji_mapping = {}
+        for sticker in sticker_set.stickers:
+            if getattr(sticker, 'custom_emoji_id', None):
+                emoji_mapping[sticker.emoji] = str(sticker.custom_emoji_id)
+
+        if not emoji_mapping:
+            await status_msg.edit_text("❌ В этом наборе нет кастомных эмодзи (возможно, это обычный пак стикеров).")
+            return
+
+        import json
+        formatted_json = json.dumps(emoji_mapping, ensure_ascii=False, indent=2)
+
+        response_text = (
+            f"✅ <b>Найдено кастомных эмодзи: {len(emoji_mapping)}</b>\n\n"
+            f"Скопируйте этот JSON в ваш файл <code>data/emojis.json</code>:\n"
+            f"<pre><code class=\"language-json\">{formatted_json}</code></pre>"
+        )
+
+        if len(response_text) > 4000:
+            from aiogram.types import BufferedInputFile
+            file_data = formatted_json.encode('utf-8')
+            file_input = BufferedInputFile(file_data, filename=f"{pack_name}_emojis.json")
+            await status_msg.delete()
+            await message.reply_document(
+                file_input,
+                caption=f"✅ Найдено {len(emoji_mapping)} эмодзи в паке <code>{pack_name}</code>."
+            )
+        else:
+            await status_msg.edit_text(response_text)
+
+    except Exception as e:
+        logger.error("Ошибка при парсинге эмодзи-пака", pack_name=pack_name, error=e)
+        await status_msg.edit_text(
+            f"❌ <b>Ошибка при загрузке пака</b>\n\n"
+            f"Не удалось получить пак <code>{pack_name}</code>.\n"
+            f"Убедитесь, что название верное и пак существует на серверах Telegram."
+        )
 
 
 def register_handlers(dp: Dispatcher):
@@ -386,5 +449,7 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(clear_rules_command, Command('clear_rules'))
 
     dp.message.register(rules_stats_command, Command('rules_stats'))
+
+    dp.message.register(parse_emoji_command, Command('parse_emoji'))
 
     dp.message.register(admin_commands_help, Command('admin_help'))
