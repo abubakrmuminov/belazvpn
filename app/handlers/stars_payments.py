@@ -10,7 +10,7 @@ from app.config import settings
 from app.database.crud.user import get_user_by_telegram_id
 from app.external.telegram_stars import TelegramStarsService
 from app.localization.loader import DEFAULT_LANGUAGE
-from app.localization.texts import get_texts
+from app.localization.texts import Texts, get_texts
 from app.services.payment_service import PaymentService
 
 
@@ -343,7 +343,7 @@ async def _handle_trial_payment(
             f'🎉 <b>Пробная подписка активирована!</b>\n\n'
             f'⭐ Потрачено: {stars_amount} Stars\n'
             f'📅 Период: {settings.TRIAL_DURATION_DAYS} дней\n'
-            f'📱 Устройств: {subscription.device_limit}\n\n'
+            f'📱 Устройств: {Texts.format_device_limit(subscription.device_limit)}\n\n'
             f'Используйте меню для подключения к VPN.',
             parse_mode='HTML',
         )
@@ -396,7 +396,7 @@ async def _handle_guest_purchase_payment(
                     'Stars amount mismatch for guest purchase',
                     paid_stars=stars_amount,
                     expected_stars=expected_stars,
-                    purchase_token_prefix=purchase_token[:5],
+                    purchase_id=existing.id,
                 )
                 await message.answer('❌ Сумма оплаты не совпадает с ожидаемой.')
                 return
@@ -431,7 +431,7 @@ async def _handle_guest_purchase_payment(
                 '✅ Guest purchase fulfilled via Stars',
                 user_id=user.id,
                 stars_amount=stars_amount,
-                purchase_token_prefix=purchase_token[:5],
+                purchase_id=existing.id if existing else None,
             )
         else:
             logger.error('try_fulfill_guest_purchase returned None for Stars gift', payload=payload)

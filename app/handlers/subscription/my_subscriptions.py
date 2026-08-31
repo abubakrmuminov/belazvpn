@@ -19,7 +19,7 @@ from app.database.crud.subscription import (
     get_subscription_by_id_for_user,
 )
 from app.database.models import Subscription, SubscriptionStatus, User
-from app.localization.texts import get_texts
+from app.localization.texts import Texts, get_texts
 from app.services.subscription_service import SubscriptionService
 
 
@@ -64,7 +64,7 @@ def _format_subscription_line(sub, idx: int) -> str:
         traffic = f'{used}/{sub.traffic_limit_gb} ГБ'
 
     # Devices
-    devices = f'{sub.device_limit} устр.' if sub.device_limit else ''
+    devices = f'{Texts.format_device_limit(sub.device_limit)} устр.' if sub.device_limit is not None else ''
 
     # End date
     end_date = sub.end_date.strftime('%d.%m.%Y') if sub.end_date else '—'
@@ -78,7 +78,9 @@ def _format_subscription_line(sub, idx: int) -> str:
     return '\n'.join(parts)
 
 
-def _build_subscriptions_keyboard(subscriptions: list, language: str) -> types.InlineKeyboardMarkup:
+def _build_subscriptions_keyboard(
+    subscriptions: list, language: str, gift_enabled: bool = False
+) -> types.InlineKeyboardMarkup:
     """Build inline keyboard with per-subscription management buttons."""
     buttons = []
     for idx, sub in enumerate(subscriptions, 1):
@@ -100,6 +102,15 @@ def _build_subscriptions_keyboard(subscriptions: list, language: str) -> types.I
             types.InlineKeyboardButton(text=f'➕ {buy_text}', callback_data='menu_buy'),
         ]
     )
+    if gift_enabled:
+        buttons.append(
+            [
+                types.InlineKeyboardButton(
+                    text=texts.t('GIFT_SUBSCRIPTION_BUTTON', '🎁 Подарить подписку'),
+                    callback_data='subscription_gift',
+                )
+            ]
+        )
     # Back button
     buttons.append(
         [
@@ -159,23 +170,33 @@ async def show_my_subscriptions(
         # Fallback to legacy single subscription view
         return
 
+    texts = get_texts(db_user.language)
+    gift_enabled = True
     subscriptions = await get_all_subscriptions_by_user_id(db, db_user.id)
 
     if not subscriptions:
         text = '📋 <b>Мои подписки</b>\n\nУ вас нет подписок.'
-        keyboard = types.InlineKeyboardMarkup(
-            inline_keyboard=[
-                [types.InlineKeyboardButton(text='🛒 Купить подписку', callback_data='menu_buy')],
-                [types.InlineKeyboardButton(text='◀️ Назад', callback_data='back_to_menu')],
-            ]
-        )
+        buttons = [
+            [types.InlineKeyboardButton(text='🛒 Купить подписку', callback_data='menu_buy')],
+        ]
+        if gift_enabled:
+            buttons.append(
+                [
+                    types.InlineKeyboardButton(
+                        text=texts.t('GIFT_SUBSCRIPTION_BUTTON', '🎁 Подарить подписку'),
+                        callback_data='subscription_gift',
+                    )
+                ]
+            )
+        buttons.append([types.InlineKeyboardButton(text='◀️ Назад', callback_data='back_to_menu')])
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=buttons)
     else:
         lines = ['📋 <b>Мои подписки</b>\n']
         for idx, sub in enumerate(subscriptions, 1):
             lines.append(_format_subscription_line(sub, idx))
             lines.append('')  # empty line between subscriptions
         text = '\n'.join(lines)
-        keyboard = _build_subscriptions_keyboard(subscriptions, db_user.language)
+        keyboard = _build_subscriptions_keyboard(subscriptions, db_user.language, gift_enabled=gift_enabled)
 
     if callback.message:
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode='HTML')
@@ -221,7 +242,7 @@ async def show_subscription_detail(
         f'📋 <b>{tariff_name}</b>\n\n'
         f'Статус: {status}\n'
         f'📊 Трафик: {traffic}\n'
-        f'📱 Устройства: {subscription.device_limit}\n'
+        f'📱 Устройства: {Texts.format_device_limit(subscription.device_limit)}\n'
         f'📅 До: {end_date}\n'
     )
 
@@ -329,7 +350,7 @@ async def handle_subscription_devices(
     else:
         can_buy_devices = settings.is_devices_selection_enabled()
 
-    current_devices = subscription.device_limit or 0
+    current_devices = Texts.format_device_limit(subscription.device_limit)
     text = f'📱 <b>Устройства</b>\n\nТекущий лимит: {current_devices} устройств\n\nВыберите действие:'
 
     keyboard = []
@@ -459,16 +480,46 @@ async def handle_subscription_delete_execute(
         )
         return
 
+    # Best-effort: stop Platega SBP autopay before the row disappears — the
+    # platega_subscriptions record CASCADE-deletes with it, so cancelling
+    # after the delete would find nothing to cancel on Platega's side.
+    # NOTE: this commits its own transaction internally, which releases the
+    # grace-guard's Postgres advisory lock acquired just above. It therefore
+    # runs BEFORE any irreversible panel/DB step, and the guard is
+    # re-acquired immediately below — closing that window before anything
+    # that can't be undone happens.
+    from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+    from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+    await cancel_platega_recurring_for_subscription_safe(db, subscription.id)
+
+    await cancel_lava_recurring_for_subscription_safe(db, subscription.id)
+    try:
+        await ensure_no_open_grace_for_subscriptions(db, (subscription.id,))
+    except GraceAccessDeletionBlocked:
+        await callback.answer(
+            'Подписку нельзя удалить, пока действует временный доступ для продления.',
+            show_alert=True,
+        )
+        return
+
     # Delete from RemnaWave panel (stops webhooks / phantom notifications)
-    if subscription.remnawave_uuid:
+    if subscription.remnawave_id:
         try:
             from app.services.remnawave_webhook_service import RemnaWaveWebhookService
 
             # Suppress the self-inflicted user.deleted webhook so its sibling-expiry
             # sweep never touches the user's other (still-active) subscriptions.
-            RemnaWaveWebhookService.mark_intentional_panel_deletion(panel_uuids=[subscription.remnawave_uuid])
+            # Только по панельному id: `id` — обязательное поле UsersSchema в
+            # 3.0.0, поэтому этот уровень guard'а срабатывает всегда. Добавить
+            # сюда telegram_id значило бы на 5 минут заглушить user.deleted для
+            # ВСЕХ панельных аккаунтов этого пользователя — включая законное
+            # удаление соседней подписки оператором.
+            RemnaWaveWebhookService.mark_intentional_panel_deletion(
+                panel_user_ids=[subscription.remnawave_id],
+            )
             service = SubscriptionService()
-            await service.delete_remnawave_user(subscription.remnawave_uuid)
+            await service.delete_remnawave_user(subscription.remnawave_id)
         except Exception as e:
             logger.warning('Failed to delete RemnaWave user on subscription delete', error=e)
 

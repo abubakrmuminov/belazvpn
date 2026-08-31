@@ -448,7 +448,17 @@ async def switch_tariff(
 
     # Reset device limit to new tariff base (extra purchased devices are not carried over)
     from app.database.crud.subscription import calc_device_limit_on_tariff_switch
+    from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
 
+    # Смена тарифа делает СБП-привязку Platega несогласованной: она продолжила бы
+    # списывать сумму СТАРОГО тарифа со старым каденсом. Отменяем привязку до
+    # мутаций — юзер переподключит СБП-автопродление под новый тариф (нужна
+    # новая банковская авторизация, молча пересоздать нельзя).
+    from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+    await cancel_platega_recurring_for_subscription_safe(db, subscription.id)
+
+    await cancel_lava_recurring_for_subscription_safe(db, subscription.id)
     # Re-load subscription to avoid MissingGreenlet from expired lazy relationship
     # (subtract_user_balance re-selects User with populate_existing=True which expires relationships)
     await db.refresh(subscription)
@@ -508,9 +518,9 @@ async def switch_tariff(
     try:
         subscription_service = SubscriptionService()
         _has_panel = (
-            getattr(subscription, 'remnawave_uuid', None)
+            getattr(subscription, 'remnawave_id', None)
             if settings.is_multi_tariff_enabled()
-            else getattr(user, 'remnawave_uuid', None)
+            else getattr(user, 'remnawave_id', None)
         )
         if _has_panel:
             await subscription_service.update_remnawave_user(
@@ -539,18 +549,23 @@ async def switch_tariff(
 
     # Reset all devices on tariff switch
     devices_reset = False
-    _switch_uuid = (
-        subscription.remnawave_uuid
-        if settings.is_multi_tariff_enabled() and subscription.remnawave_uuid
-        else user.remnawave_uuid
+    _switch_panel_user_id = (
+        subscription.remnawave_id
+        if settings.is_multi_tariff_enabled() and subscription.remnawave_id
+        else user.remnawave_id
     )
-    if _switch_uuid:
+    if _switch_panel_user_id:
         try:
             service = RemnaWaveService()
             async with service.get_api_client() as api:
-                await api.reset_user_devices(_switch_uuid)
-                devices_reset = True
-                logger.info('Reset all devices for user on tariff switch', user_id=user.id)
+                # 3.0.0: сброс делается одним delete-all и исключений наружу не
+                # бросает — сбой панели приходит как False, поэтому флаг ставим
+                # по результату, а не по «не упало».
+                devices_reset = await api.reset_user_devices(_switch_panel_user_id)
+                if devices_reset:
+                    logger.info('Reset all devices for user on tariff switch', user_id=user.id)
+                else:
+                    logger.error('Failed to reset devices on tariff switch', user_id=user.id)
         except Exception as e:
             logger.error('Failed to reset devices on tariff switch', error=e)
 

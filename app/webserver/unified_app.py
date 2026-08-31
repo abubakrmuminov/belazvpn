@@ -172,9 +172,23 @@ def create_unified_app(
     app.state.dispatcher = dispatcher
     app.state.payment_service = payment_service
 
+    # Republish global ticket events onto the mobile support socket so live
+    # updates reach the admin apps for ALL origins (Telegram, Web API, cabinet,
+    # mini-app), not just support-socket self-echo.
+    if settings.is_cabinet_enabled():
+        from app.cabinet.routes.support_ws import register_support_ticket_event_bridge
+
+        register_support_ticket_event_bridge()
+
     payments_router = payments.create_payment_router(bot, payment_service)
     if payments_router:
         app.include_router(payments_router)
+
+        # ПЕРВЫМ в порядке shutdown: часть платёжных вебхуков отвечает 200 сразу
+        # и дорабатывает в фоне, а провайдер после 200 коллбек не повторит. Дренаж
+        # обязан отработать, пока живы и telegram-процессор (фон шлёт уведомление
+        # о зачислении), и пул БД — то есть до всех остановок ниже.
+        shutdown_handlers.append(payments.drain_webhook_bg_tasks)
 
     # Mount RemnaWave incoming webhook router
     remnawave_webhook_enabled = settings.is_remnawave_webhook_enabled()
@@ -206,6 +220,15 @@ def create_unified_app(
         'freekassa': settings.is_freekassa_enabled(),
         'riopay': settings.is_riopay_enabled(),
     }
+
+    # Маршруты вебхуков фиксируются на старте по учётным данным, а флаги
+    # включения переключают в рантайме. Провайдер, включённый уже после
+    # запуска и без кредов в конфиге, принимает оплату, но его коллбек падает
+    # в 404 — и увидеть это неоткуда, запрос до бота не доходит. Поэтому
+    # список смонтированных путей отдаётся в health рядом с флагами.
+    payment_webhook_paths = sorted(
+        {route.path for route in getattr(payments_router, 'routes', []) if getattr(route, 'path', None)}
+    )
 
     if enable_telegram_webhook:
         telegram_processor = telegram.TelegramWebhookProcessor(
@@ -267,6 +290,7 @@ def create_unified_app(
         payment_state = {
             'enabled': bool(payments_router),
             'providers': payment_providers_state,
+            'mounted_paths': payment_webhook_paths,
         }
 
         miniapp_state = {

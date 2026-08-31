@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -69,6 +71,12 @@ class BroadcastConfig:
     initiator_name: str | None = None
     custom_buttons: list[dict] | None = None
     category: str = 'system'  # system|news|promo
+    # Явный список telegram_id вместо резолва target'а. Нужен отправкам, где получатели
+    # уже посчитаны вызывающим кодом (промопредложения создают оффер на каждого).
+    recipient_ids: list[int] | None = None
+    # Персональная клавиатура на получателя (у промопредложений в callback_data зашит
+    # id его оффера). Если задана — вытесняет selected_buttons/custom_buttons.
+    keyboard_factory: Callable[[int], InlineKeyboardMarkup | None] | None = None
 
 
 @dataclass
@@ -79,6 +87,7 @@ class EmailBroadcastConfig:
     email_subject: str
     email_html_content: str
     initiator_name: str | None = None
+    category: str = 'system'  # system|news|promo — как у Telegram-рассылки
 
 
 @dataclass(slots=True)
@@ -87,6 +96,7 @@ class _EmailRecipient:
 
     email: str
     user_name: str
+    user_id: int = 0
 
 
 @dataclass(slots=True)
@@ -167,7 +177,10 @@ class BroadcastService:
                 await session.commit()
 
             # _fetch_recipients теперь возвращает list[int] (telegram_id), а не ORM-объекты
-            recipient_ids: list[int] = await self._fetch_recipients(config.target, config.category)
+            if config.recipient_ids is not None:
+                recipient_ids: list[int] = list(config.recipient_ids)
+            else:
+                recipient_ids = await self._fetch_recipients(config.target, config.category)
 
             async with AsyncSessionLocal() as session:
                 broadcast = await session.get(BroadcastHistory, broadcast_id)
@@ -187,7 +200,11 @@ class BroadcastService:
                 await self._mark_finished(broadcast_id, sent_count, failed_count, blocked_count, cancelled=False)
                 return
 
-            keyboard = self._build_keyboard(config.selected_buttons, config.custom_buttons)
+            keyboard = (
+                None
+                if config.keyboard_factory
+                else self._build_keyboard(config.selected_buttons, config.custom_buttons)
+            )
 
             logger.info(
                 'Рассылка: начинаем отправку получателям',
@@ -248,15 +265,10 @@ class BroadcastService:
                 users_orm = await get_target_users(session, target)
 
             # Filter by user notification preferences based on broadcast category
-            if category == 'news':
-                from app.utils.notification_prefs import is_news_enabled
+            from app.utils.notification_prefs import filter_users_by_broadcast_category
 
-                users_orm = [u for u in users_orm if is_news_enabled(u)]
-            elif category == 'promo':
-                from app.utils.notification_prefs import is_promo_offers_enabled
-
-                users_orm = [u for u in users_orm if is_promo_offers_enabled(u)]
             # category == 'system' → no filtering, sent to everyone
+            users_orm = filter_users_by_broadcast_category(users_orm, category)
 
             # Извлекаем telegram_id сразу, пока сессия жива.
             # После выхода из блока ORM-объекты станут detached.
@@ -303,7 +315,11 @@ class BroadcastService:
                     return 'failed'
 
                 try:
-                    await self._deliver_message(telegram_id, config, keyboard)
+                    await self._deliver_message(
+                        telegram_id,
+                        config,
+                        config.keyboard_factory(telegram_id) if config.keyboard_factory else keyboard,
+                    )
                     return 'sent'
 
                 except TelegramRetryAfter as e:
@@ -436,6 +452,21 @@ class BroadcastService:
                 parse_mode='HTML',
                 reply_markup=keyboard,
             )
+            return
+
+        # Медиа-ветка выше уходит как есть: rich-сообщение не несёт загруженный
+        # по file_id файл. Текстовую рассылку показываем в том же виде, что меню и
+        # остальные уведомления; при отказе ниже отрабатывает обычная отправка.
+        from app.config import settings
+        from app.utils.rich_notify import try_send_rich_notification
+
+        if await try_send_rich_notification(
+            self._bot,
+            telegram_id,
+            config.message_text,
+            keyboard=keyboard,
+            with_logo=settings.ENABLE_LOGO_MODE,
+        ):
             return
 
         await self._bot.send_message(
@@ -576,6 +607,13 @@ async def cleanup_blocked_broadcast_users(blocked_telegram_ids: list[int]) -> No
                 if not user or user.status == UserStatus.BLOCKED.value:
                     continue
 
+                from app.services.rbac_bootstrap_service import is_protected_from_blocking
+
+                if is_protected_from_blocking(user):
+                    # An admin who muted the bot must not lose access to it.
+                    logger.info('Пропуск авто-блокировки: аккаунт админа из env', telegram_id=telegram_id)
+                    continue
+
                 user.status = UserStatus.BLOCKED.value
 
                 # Проверяем, есть ли активная оплаченная подписка
@@ -617,10 +655,10 @@ async def cleanup_blocked_broadcast_users(blocked_telegram_ids: list[int]) -> No
                 if settings.is_multi_tariff_enabled():
                     await session.refresh(user, ['subscriptions'])
                     for sub in user.subscriptions or []:
-                        if sub.remnawave_uuid:
-                            await subscription_service.disable_remnawave_user(sub.remnawave_uuid)
-                elif user.remnawave_uuid:
-                    await subscription_service.disable_remnawave_user(user.remnawave_uuid)
+                        if sub.remnawave_id:
+                            await subscription_service.disable_remnawave_user(sub.remnawave_id)
+                elif user.remnawave_id:
+                    await subscription_service.disable_remnawave_user(user.remnawave_id)
 
                 logger.info(
                     'Заблокированный пользователь очищен при рассылке',
@@ -721,7 +759,7 @@ class EmailBroadcastService:
                 await session.commit()
 
             # Fetch email recipients
-            recipients = await self._fetch_email_recipients(config.target)
+            recipients = await self._fetch_email_recipients(config.target, config.category)
 
             # Update total count
             async with AsyncSessionLocal() as session:
@@ -763,16 +801,21 @@ class EmailBroadcastService:
             logger.exception('Critical error in email broadcast', broadcast_id=broadcast_id, exc=exc)
             await self._mark_failed(broadcast_id, sent_count, failed_count)
 
-    async def _fetch_email_recipients(self, target: str) -> list[_EmailRecipient]:
+    async def _fetch_email_recipients(self, target: str, category: str = 'system') -> list[_EmailRecipient]:
         """
         Загружает получателей email-рассылки.
 
         Возвращает список _EmailRecipient (скалярные данные), а не ORM-объектов,
         чтобы избежать detached state при долгих рассылках.
+
+        Фильтрует по тем же тумблерам кабинета, что и Telegram-путь: до этого
+        выключенные новости резали только Telegram, а на почту всё равно
+        приходили.
         """
         from sqlalchemy import select
 
         from app.database.models import Subscription, SubscriptionStatus, User
+        from app.utils.notification_prefs import filter_users_by_broadcast_category
 
         async with AsyncSessionLocal() as session:
             # Base query: verified email users with active status
@@ -839,7 +882,7 @@ class EmailBroadcastService:
                 if not batch:
                     break
 
-                for user in batch:
+                for user in filter_users_by_broadcast_category(list(batch), category):
                     email = user.email
                     if not email:
                         continue
@@ -853,7 +896,7 @@ class EmailBroadcastService:
                     if not user_name:
                         user_name = email.split('@')[0]
 
-                    recipients.append(_EmailRecipient(email=email, user_name=user_name))
+                    recipients.append(_EmailRecipient(email=email, user_name=user_name, user_id=user.id))
 
                 offset += batch_size
 
@@ -877,6 +920,8 @@ class EmailBroadcastService:
         last_progress_count = 0
         last_progress_time: float = 0.0
 
+        from app.cabinet.services.email_unsubscribe import build_unsubscribe_url
+
         semaphore = asyncio.Semaphore(EMAIL_RATE_LIMIT)
 
         async def send_single_email(recipient: _EmailRecipient) -> bool | None:
@@ -888,14 +933,24 @@ class EmailBroadcastService:
                 html_content = self._render_template(config.email_html_content, recipient)
                 subject = self._render_template(config.email_subject, recipient)
 
+                # Системные рассылки отписке не подлежат — заголовок им не ставим.
+                unsubscribe_url = (
+                    build_unsubscribe_url(recipient.user_id, recipient.email)
+                    if config.category in ('news', 'promo')
+                    else ''
+                )
+
                 try:
                     loop = asyncio.get_event_loop()
                     success = await loop.run_in_executor(
                         None,
-                        self._email_service.send_email,
-                        recipient.email,
-                        subject,
-                        html_content,
+                        functools.partial(
+                            self._email_service.send_email,
+                            to_email=recipient.email,
+                            subject=subject,
+                            body_html=html_content,
+                            unsubscribe_url=unsubscribe_url or None,
+                        ),
                     )
                     return success
                 except Exception as exc:

@@ -23,6 +23,7 @@ from starlette.websockets import WebSocketState
 
 from app.bot_factory import create_bot
 from app.cabinet.auth.jwt_handler import get_token_payload
+from app.cabinet.auth.registration_access import evaluate_public_registration
 from app.cabinet.auth.telegram_auth import validate_telegram_init_data
 from app.cabinet.routes.media import (
     _BLOCKED_UPLOAD_CONTENT_TYPES,
@@ -35,6 +36,7 @@ from app.cabinet.routes.media import (
 from app.cabinet.routes.websocket import notify_admins_ticket_reply, notify_user_ticket_reply
 from app.config import settings
 from app.database.crud.rbac import SUPERADMIN_LEVEL, UserRoleCRUD
+from app.database.crud.ticket import TicketCRUD
 from app.database.crud.ticket_notification import TicketNotificationCRUD
 from app.database.crud.user import get_user_by_id
 from app.database.database import AsyncSessionLocal
@@ -43,6 +45,12 @@ from app.services.blacklist_service import blacklist_service
 from app.services.maintenance_service import maintenance_service
 from app.services.permission_service import PermissionService
 from app.services.rbac_bootstrap_service import is_user_admin_by_env
+from app.services.registration_access_service import (
+    RegistrationAccessDecision,
+    RegistrationAccessReason,
+    RegistrationChannel,
+)
+from app.services.support_settings_service import SupportSettingsService
 from app.services.user_revival_service import NotDeletedError, revive_deleted_user
 
 
@@ -394,9 +402,32 @@ async def _apply_cabinet_account_guards(
             return _shared_error('FORBIDDEN', 'User is blacklisted', resource_type='auth')
 
     status_value = _user_status_value(user)
+    access_decision = None
+    if status_value != UserStatus.ACTIVE.value:
+        if is_user_admin_by_env(user).is_admin:
+            # Env config outranks any status flag — see get_current_cabinet_user.
+            access_decision = RegistrationAccessDecision(True, RegistrationAccessReason.VERIFIED_ADMIN)
+        elif not settings.INVITE_ONLY_ENABLED:
+            access_decision = RegistrationAccessDecision(True, RegistrationAccessReason.INVITE_ONLY_DISABLED)
+        else:
+            access_decision = await evaluate_public_registration(
+                db,
+                channel=RegistrationChannel.CABINET_SUPPORT_WS,
+                existing_user=user,
+                telegram_id=user.telegram_id,
+                email=user.email,
+                email_verified=bool(user.email_verified),
+                verified_admin=False,
+            )
     if status_value != UserStatus.ACTIVE.value:
         can_auto_revive = (
-            status_value == UserStatus.DELETED.value and user.telegram_id is not None and init_data_matches_user
+            status_value == UserStatus.DELETED.value
+            and user.telegram_id is not None
+            and (
+                init_data_matches_user
+                or bool(access_decision and access_decision.reason is RegistrationAccessReason.VERIFIED_ADMIN)
+            )
+            and bool(access_decision and access_decision.allowed)
         )
         if can_auto_revive:
             try:
@@ -405,6 +436,11 @@ async def _apply_cabinet_account_guards(
                 await db.refresh(user)
             except NotDeletedError:
                 logger.info('Support WS auto-revival race: user already revived', user_id=user.id)
+        elif access_decision and access_decision.reason is RegistrationAccessReason.VERIFIED_ADMIN:
+            user.status = UserStatus.ACTIVE.value
+            user.updated_at = datetime.now(UTC)
+            await db.commit()
+            await db.refresh(user)
         elif status_value == UserStatus.DELETED.value:
             return _shared_error(
                 'FORBIDDEN', 'Account is deleted and must be restored through the bot', resource_type='auth'
@@ -833,6 +869,16 @@ async def _handle_ticket_reply(db: AsyncSession, session: SupportWsSession, payl
         raise RuntimeError('TICKET_CLOSED')
     if session.context.role == 'owner' and _is_ticket_reply_blocked(ticket):
         raise PermissionError('Replies to this ticket are blocked')
+    if session.context.role == 'owner':
+        # Паритет с REST-роутом (_ensure_tickets_enabled / _ensure_not_blocked).
+        # Здесь проверялась только per-ticket блокировка, поэтому глобальный бан в
+        # поддержке и выключённые тикеты обходились сменой клиента: сокет принимал
+        # ответ, который POST /cabinet/tickets/{id}/messages уже отклонял.
+        if not SupportSettingsService.is_tickets_enabled():
+            raise PermissionError('Support tickets are disabled')
+        blocked_until = await TicketCRUD.is_user_globally_blocked(db, session.context.user_id)
+        if blocked_until:
+            raise PermissionError('You are blocked from contacting support')
 
     replay = _check_idempotency(session, payload.get('idempotencyKey'), payload)
     if replay is not None:
@@ -1512,3 +1558,149 @@ async def support_mobile_websocket_endpoint(websocket: WebSocket):
                 await websocket.close()
             except RuntimeError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Support ticket event bridge
+#
+# Republishes the global event_emitter ticket events onto this mobile support
+# socket so live updates reach the admin apps for ALL origins (Telegram, Web
+# API, cabinet, mini-app) — not just this socket's own self-echo. Registered
+# once at app startup (see app/webserver/unified_app.py). Emits ONLY the
+# whitelisted support-v1 events (message.created / ticket.status.updated).
+# ---------------------------------------------------------------------------
+
+_bridge_registered = False
+_bridge_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _load_ticket_for_event(db: AsyncSession, ticket_id: int) -> Ticket | None:
+    result = await db.execute(
+        select(Ticket).where(Ticket.id == ticket_id).options(selectinload(Ticket.messages), selectinload(Ticket.user))
+    )
+    return result.scalar_one_or_none()
+
+
+def _pick_message(ticket: Ticket, message_id: int | None) -> TicketMessage | None:
+    messages = sorted(ticket.messages or [], key=lambda item: item.created_at)
+    if not messages:
+        return None
+    if message_id is not None:
+        for message in messages:
+            if message.id == message_id:
+                return message
+    return messages[-1]
+
+
+async def _broadcast_message_created(db: AsyncSession, ticket: Ticket, message: TicketMessage) -> None:
+    event = _message_event(
+        'message.created',
+        {
+            'ticketId': str(ticket.id),
+            'message': _message_snapshot(message),
+            'ticketSnapshot': _ticket_snapshot(ticket),
+        },
+        ticket=ticket,
+    )
+    await support_ws_manager.broadcast_ticket_event(db, ticket, event)
+
+
+async def _bridge_message_added(payload: dict[str, Any]) -> None:
+    ticket_id = _coerce_int(payload.get('ticket_id'))
+    if ticket_id is None:
+        return
+    async with AsyncSessionLocal() as db:
+        ticket = await _load_ticket_for_event(db, ticket_id)
+        if ticket is None:
+            return
+        message = _pick_message(ticket, _coerce_int(payload.get('message_id')))
+        if message is None:
+            return
+        await _broadcast_message_created(db, ticket, message)
+
+
+async def _broadcast_status_updated(db: AsyncSession, ticket: Ticket, previous_status: str | None) -> None:
+    event = _message_event(
+        'ticket.status.updated',
+        {
+            'ticketId': str(ticket.id),
+            'previousStatus': previous_status,
+            'status': ticket.status,
+            'ticketSnapshot': _ticket_snapshot(ticket),
+        },
+        ticket=ticket,
+    )
+    await support_ws_manager.broadcast_ticket_event(db, ticket, event)
+
+
+async def _bridge_ticket_created(payload: dict[str, Any]) -> None:
+    ticket_id = _coerce_int(payload.get('ticket_id'))
+    if ticket_id is None:
+        return
+    async with AsyncSessionLocal() as db:
+        ticket = await _load_ticket_for_event(db, ticket_id)
+        if ticket is None:
+            return
+        message = _pick_message(ticket, None)
+        if message is None:
+            return
+        await _broadcast_message_created(db, ticket, message)
+
+
+async def _bridge_status_changed(payload: dict[str, Any]) -> None:
+    ticket_id = _coerce_int(payload.get('ticket_id'))
+    if ticket_id is None:
+        return
+    async with AsyncSessionLocal() as db:
+        ticket = await _load_ticket_for_event(db, ticket_id)
+        if ticket is None:
+            return
+        await _broadcast_status_updated(db, ticket, payload.get('old_status'))
+
+
+async def _run_bridge(handler: Any, payload: dict[str, Any]) -> None:
+    try:
+        await handler(payload)
+    except Exception as exc:  # never let a bridge failure escape into the emitter
+        logger.warning('Support ticket bridge delivery failed', error=str(exc))
+
+
+def _schedule_bridge(handler: Any, event_data: dict[str, Any]) -> None:
+    raw = event_data.get('payload')
+    payload = raw if isinstance(raw, dict) else {}
+    task = asyncio.create_task(_run_bridge(handler, payload))
+    _bridge_tasks.add(task)
+    task.add_done_callback(_bridge_tasks.discard)
+
+
+def _bridge_listener_message_added(event_data: dict[str, Any]) -> None:
+    _schedule_bridge(_bridge_message_added, event_data)
+
+
+def _bridge_listener_ticket_created(event_data: dict[str, Any]) -> None:
+    _schedule_bridge(_bridge_ticket_created, event_data)
+
+
+def _bridge_listener_status_changed(event_data: dict[str, Any]) -> None:
+    _schedule_bridge(_bridge_status_changed, event_data)
+
+
+def register_support_ticket_event_bridge() -> None:
+    """Attach the support-socket bridge to the global event emitter (idempotent)."""
+    global _bridge_registered
+    if _bridge_registered:
+        return
+    from app.services.event_emitter import event_emitter
+
+    event_emitter.on('ticket.message_added', _bridge_listener_message_added)
+    event_emitter.on('ticket.created', _bridge_listener_ticket_created)
+    event_emitter.on('ticket.status_changed', _bridge_listener_status_changed)
+    _bridge_registered = True
+    logger.info('Support ticket event bridge registered')

@@ -1,26 +1,31 @@
 [project]
 name = 'remnawave-bedolaga-telegram-bot'
-version = "3.65.1"
+version = "4.2.0"
 description = 'Telegram bot for RemnaWave VPN service'
 readme = 'README.md'
 license = { text = 'MIT' }
 requires-python = '==3.13.*'
 dependencies = [
-    "aiogram>=3.29.1",
+    "aiogram>=3.31.0",
     'sqlalchemy>=2.0.46',
+    # Нужен асинхронному SQLAlchemy. Сам он тянет greenlet по маркеру
+    # platform_machine, где есть aarch64, но НЕТ arm64 — на Apple Silicon пакет
+    # не ставился, и весь пласт тестов с БД падал локально. На Linux это ничего
+    # не меняет: туда greenlet приходил и раньше.
+    'greenlet>=3.0',
     'alembic>=1.18.4',
     'asyncpg>=0.31.0',
     'aiosqlite>=0.22.1',
-    'fastapi[standard]>=0.129.0',
+    'fastapi[standard]>=0.139.2',
     'redis>=7.1.1',
     'pyyaml>=6.0.3',
     'yookassa>=3.10.0',
     'python-dateutil>=2.9.0.post0',
-    'cryptography>=44.0.1',
+    'cryptography>=48.0.1',
     'qrcode[pil]>=8.0',
     'packaging>=26.0',
     'bcrypt>=5.0.0',
-    'pyjwt>=2.11.0',
+    'pyjwt>=2.13.0',
     'pyzipper>=0.3.6',
     'structlog>=25.1.0,<26',
     'rich>=14.0',
@@ -32,7 +37,12 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    'ruff',
+    # Закреплён на 0.14.x. В 0.15 расширили стилевые правила: на текущем коде
+    # это 48 замечаний, в 0.16 — 58. Больше половины (PLW0108) имеют только
+    # небезопасный фикс — он меняет момент вычисления аргументов, применять
+    # пачкой в хендлерах нельзя. Бампать отдельной задачей, не вместе с
+    # обновлением безопасности.
+    'ruff<0.15',
     'pytest',
     'pytest-asyncio',
     'pytest-cov',

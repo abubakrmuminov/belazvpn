@@ -41,7 +41,7 @@ from app.keyboards.admin import (
     get_user_promo_group_keyboard,
     get_user_restrictions_keyboard,
 )
-from app.localization.texts import get_texts
+from app.localization.texts import Texts, get_texts
 from app.services.grace_access_runtime import (
     create_panel_user_grace_safe,
     update_panel_user_grace_safe,
@@ -924,7 +924,7 @@ async def _render_user_subscription_overview(
         text += f'<b>Начало:</b> {format_datetime(subscription.start_date)}\n'
         text += f'<b>Окончание:</b> {format_datetime(subscription.end_date)}\n'
         text += f'<b>Трафик:</b> {traffic_display}\n'
-        text += f'<b>Устройства:</b> {subscription.device_limit}\n'
+        text += f'<b>Устройства:</b> {Texts.format_device_limit(subscription.device_limit)}\n'
 
         if subscription.is_active:
             days_left = (subscription.end_date - datetime.now(UTC)).days
@@ -1328,7 +1328,7 @@ async def show_user_management(callback: types.CallbackQuery, db_user: User, db:
                 status=subscription_status,
                 end_date=format_datetime(subscription.end_date),
                 traffic=traffic_usage,
-                devices=subscription.device_limit,
+                devices=Texts.format_device_limit(subscription.device_limit),
                 countries=len(subscription.connected_squads or []),
             )
         )
@@ -1455,7 +1455,17 @@ async def _build_user_referrals_view(
 
     lines: list[str] = [header, summary]
 
-    if user.referral_commission_percent is None:
+    if user.referral_commission_percent is None and settings.is_referral_levels_scheme():
+        # В многоуровневой схеме «стандартный процент» не существует: у каждого
+        # уровня свой, а пустой означает ноль. Печатать REFERRAL_COMMISSION_PERCENT
+        # значит называть админу ставку, по которой ничего не начисляется.
+        lines.append(
+            texts.t(
+                'ADMIN_USER_REFERRAL_COMMISSION_LEVELS',
+                '• Процент комиссии: по уровням реферальной схемы',
+            )
+        )
+    elif user.referral_commission_percent is None:
         lines.append(
             texts.t(
                 'ADMIN_USER_REFERRAL_COMMISSION_DEFAULT',
@@ -2839,7 +2849,7 @@ async def show_user_statistics(callback: types.CallbackQuery, db_user: User, db:
         sub_type = ' (пробная)' if subscription.is_trial else ' (платная)'
         text += f'• Статус: {sub_status}{sub_type}\n'
         text += f'• Трафик: {subscription.traffic_used_gb:.1f}/{subscription.traffic_limit_gb} ГБ\n'
-        text += f'• Устройства: {subscription.device_limit}\n'
+        text += f'• Устройства: {Texts.format_device_limit(subscription.device_limit)}\n'
         text += f'• Стран: {len(subscription.connected_squads or [])}\n'
     else:
         text += '• Отсутствует\n'
@@ -3455,11 +3465,34 @@ async def confirm_subscription_deletion(callback: types.CallbackQuery, db_user: 
         )
         return
 
+    # Best-effort: stop Platega SBP autopay before the row disappears — the
+    # platega_subscriptions record CASCADE-deletes with it, so cancelling
+    # after the delete would find nothing to cancel on Platega's side.
+    # NOTE: this commits its own transaction internally, which releases the
+    # grace-guard's Postgres advisory lock acquired just above. It therefore
+    # runs BEFORE any irreversible panel/DB step, and the guard is
+    # re-acquired immediately below — closing that window before anything
+    # that can't be undone happens.
+    from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+    from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+    await cancel_platega_recurring_for_subscription_safe(db, subscription.id)
+
+    await cancel_lava_recurring_for_subscription_safe(db, subscription.id)
+    try:
+        await ensure_no_open_grace_for_subscriptions(db, (subscription.id,))
+    except GraceAccessDeletionBlocked:
+        await callback.answer(
+            'Сначала завершите или восстановите активный grace-доступ.',
+            show_alert=True,
+        )
+        return
+
     # Disable on Remnawave side first
-    _uuid = getattr(subscription, 'remnawave_uuid', None)
-    if _uuid:
+    panel_user_id = getattr(subscription, 'remnawave_id', None)
+    if panel_user_id:
         subscription_service = SubscriptionService()
-        await subscription_service.disable_remnawave_user(_uuid, db=db)
+        await subscription_service.disable_remnawave_user(panel_user_id, db=db)
 
     # Delete traffic purchases
     from sqlalchemy import delete as sql_delete
@@ -3816,19 +3849,17 @@ async def toggle_user_server(callback: types.CallbackQuery, db_user: User, db: A
         await db.commit()
         await db.refresh(subscription)
 
-        _uuid = (
-            getattr(subscription, 'remnawave_uuid', None)
-            if settings.is_multi_tariff_enabled() and subscription
-            else None
-        ) or getattr(user, 'remnawave_uuid', None)
-        if _uuid:
+        panel_user_id = (
+            getattr(subscription, 'remnawave_id', None) if settings.is_multi_tariff_enabled() and subscription else None
+        ) or getattr(user, 'remnawave_id', None)
+        if panel_user_id:
             try:
                 remnawave_service = RemnaWaveService()
                 async with remnawave_service.get_api_client() as api:
                     await update_panel_user_grace_safe(
                         api,
                         subscription.id,
-                        uuid=_uuid,
+                        user_id=panel_user_id,
                         active_internal_squads=current_squads,
                         description=settings.format_remnawave_user_description(
                             full_name=user.full_name, username=user.username, telegram_id=user.telegram_id
@@ -4252,24 +4283,24 @@ async def reset_user_devices(callback: types.CallbackQuery, db_user: User, db: A
 
     try:
         user = await get_user_by_id(db, user_id)
-        _uuid = None
+        panel_user_id = None
         if subscription_id and settings.is_multi_tariff_enabled():
             from app.database.crud.subscription import get_subscription_by_id_for_user
 
             subscription = await get_subscription_by_id_for_user(db, subscription_id, user_id)
-            _uuid = getattr(subscription, 'remnawave_uuid', None) if subscription else None
+            panel_user_id = getattr(subscription, 'remnawave_id', None) if subscription else None
         elif settings.is_multi_tariff_enabled():
             subscription = await _resolve_admin_subscription(db, user_id)
-            _uuid = getattr(subscription, 'remnawave_uuid', None) if subscription else None
-        if not _uuid:
-            _uuid = getattr(user, 'remnawave_uuid', None)
-        if not user or not _uuid:
+            panel_user_id = getattr(subscription, 'remnawave_id', None) if subscription else None
+        if not panel_user_id:
+            panel_user_id = getattr(user, 'remnawave_id', None)
+        if not user or not panel_user_id:
             await callback.answer('❌ Пользователь не найден или не связан с RemnaWave', show_alert=True)
             return
 
         remnawave_service = RemnaWaveService()
         async with remnawave_service.get_api_client() as api:
-            success = await api.reset_user_devices(_uuid)
+            success = await api.reset_user_devices(panel_user_id)
 
         if success:
             await callback.message.edit_text(
@@ -4312,17 +4343,15 @@ async def _update_user_devices(
 
         await db.commit()
 
-        _uuid = (
-            getattr(subscription, 'remnawave_uuid', None)
-            if settings.is_multi_tariff_enabled() and subscription
-            else None
-        ) or getattr(user, 'remnawave_uuid', None)
-        if _uuid:
+        panel_user_id = (
+            getattr(subscription, 'remnawave_id', None) if settings.is_multi_tariff_enabled() and subscription else None
+        ) or getattr(user, 'remnawave_id', None)
+        if panel_user_id:
             try:
                 remnawave_service = RemnaWaveService()
                 async with remnawave_service.get_api_client() as api:
                     await api.update_user(
-                        uuid=_uuid,
+                        user_id=panel_user_id,
                         hwid_device_limit=devices,
                         description=settings.format_remnawave_user_description(
                             full_name=user.full_name, username=user.username, telegram_id=user.telegram_id
@@ -4363,12 +4392,10 @@ async def _update_user_traffic(
 
         await db.commit()
 
-        _uuid = (
-            getattr(subscription, 'remnawave_uuid', None)
-            if settings.is_multi_tariff_enabled() and subscription
-            else None
-        ) or getattr(user, 'remnawave_uuid', None)
-        if _uuid:
+        panel_user_id = (
+            getattr(subscription, 'remnawave_id', None) if settings.is_multi_tariff_enabled() and subscription else None
+        ) or getattr(user, 'remnawave_id', None)
+        if panel_user_id:
             try:
                 from app.services.subscription_service import get_traffic_reset_strategy
 
@@ -4377,7 +4404,7 @@ async def _update_user_traffic(
                     await update_panel_user_grace_safe(
                         api,
                         subscription.id,
-                        uuid=_uuid,
+                        user_id=panel_user_id,
                         traffic_limit_bytes=traffic_gb * (1024**3) if traffic_gb > 0 else 0,
                         traffic_limit_strategy=get_traffic_reset_strategy(
                             subscription.tariff if subscription else None
@@ -4522,14 +4549,14 @@ async def _add_subscription_traffic(
 
         # Явно включаем пользователя на панели (PATCH может не снять LIMITED-статус)
         if subscription.status == 'active':
-            _uuid = getattr(subscription, 'remnawave_uuid', None) if settings.is_multi_tariff_enabled() else None
-            if not _uuid:
+            panel_user_id = getattr(subscription, 'remnawave_id', None) if settings.is_multi_tariff_enabled() else None
+            if not panel_user_id:
                 from app.database.crud.user import get_user_by_id
 
                 user = await get_user_by_id(db, user_id)
-                _uuid = getattr(user, 'remnawave_uuid', None)
-            if _uuid:
-                await subscription_service.enable_remnawave_user(_uuid)
+                panel_user_id = getattr(user, 'remnawave_id', None)
+            if panel_user_id:
+                await subscription_service.enable_remnawave_user(panel_user_id)
 
         traffic_text = 'безлимитный' if gb == 0 else f'{gb} ГБ'
         logger.info('Админ добавил трафик пользователю', admin_id=admin_id, traffic_text=traffic_text, user_id=user_id)
@@ -4557,12 +4584,12 @@ async def _deactivate_user_subscription(
         await deactivate_subscription(db, subscription)
 
         subscription_service = SubscriptionService()
-        _uuid = getattr(subscription, 'remnawave_uuid', None) if settings.is_multi_tariff_enabled() else None
-        if not _uuid:
+        panel_user_id = getattr(subscription, 'remnawave_id', None) if settings.is_multi_tariff_enabled() else None
+        if not panel_user_id:
             user = await get_user_by_id(db, user_id)
-            _uuid = getattr(user, 'remnawave_uuid', None)
-        if _uuid:
-            await subscription_service.disable_remnawave_user(_uuid)
+            panel_user_id = getattr(user, 'remnawave_id', None)
+        if panel_user_id:
+            await subscription_service.disable_remnawave_user(panel_user_id)
 
         logger.info('Админ деактивировал подписку пользователя', admin_id=admin_id, user_id=user_id)
         return True
@@ -4865,7 +4892,7 @@ async def admin_buy_subscription(callback: types.CallbackQuery, db_user: User, d
         devices_limit = settings.DEFAULT_DEVICE_LIMIT
     servers_count = len(subscription.connected_squads or [])
     text += f'📶 Трафик: {traffic_text}\n'
-    text += f'📱 Устройства: {devices_limit}\n'
+    text += f'📱 Устройства: {Texts.format_device_limit(devices_limit)}\n'
     text += f'🌐 Серверов: {servers_count}\n\n'
     text += 'Выберите период подписки:\n'
 
@@ -4958,7 +4985,7 @@ async def admin_buy_subscription_confirm(callback: types.CallbackQuery, db_user:
         devices_limit = settings.DEFAULT_DEVICE_LIMIT
     servers_count = len(subscription.connected_squads or [])
     text += f'📶 Трафик: {traffic_text}\n'
-    text += f'📱 Устройства: {devices_limit}\n'
+    text += f'📱 Устройства: {Texts.format_device_limit(devices_limit)}\n'
     text += f'🌐 Серверов: {servers_count}\n\n'
     text += 'Вы уверены, что хотите купить подписку для этого пользователя?'
 
@@ -5110,13 +5137,19 @@ async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user:
                     pass
                 ext_squad_uuid = subscription.tariff.external_squad_uuid if subscription.tariff else None
 
-                _uuid = (
-                    getattr(subscription, 'remnawave_uuid', None) if settings.is_multi_tariff_enabled() else None
-                ) or getattr(target_user, 'remnawave_uuid', None)
-                if _uuid:
+                # В multi-tariff фолбэка на user-уровень быть не должно: у каждой
+                # подписки СВОЙ панельный аккаунт, и продление «не той» строки
+                # переписало бы соседнему тарифу дату, лимиты и сквады, а нужный
+                # так и остался бы непродлённым. Пустой id уводит в ветку ниже,
+                # которая опознаёт аккаунт по shortUuid.
+                if settings.is_multi_tariff_enabled():
+                    panel_user_id = getattr(subscription, 'remnawave_id', None)
+                else:
+                    panel_user_id = getattr(target_user, 'remnawave_id', None)
+                if panel_user_id:
                     async with remnawave_service.get_api_client() as api:
                         update_kwargs = dict(
-                            uuid=_uuid,
+                            user_id=panel_user_id,
                             status=UserStatus.ACTIVE if subscription.is_active else UserStatus.DISABLED,
                             expire_at=subscription.end_date,
                             traffic_limit_bytes=subscription.traffic_limit_gb * (1024**3)
@@ -5132,6 +5165,12 @@ async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user:
                             ),
                             active_internal_squads=subscription.connected_squads,
                         )
+
+                        # Пустой список сквадов НЕ отправляем: `[]` в PATCH означает
+                        # «снять все инбаунды», а пустота в connected_squads — это
+                        # дефолт колонки/результат сброса, а не намерение админа.
+                        if not subscription.connected_squads:
+                            update_kwargs.pop('active_internal_squads', None)
 
                         if hwid_limit is not None:
                             update_kwargs['hwid_device_limit'] = hwid_limit
@@ -5193,14 +5232,17 @@ async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user:
                         remnawave_user = await create_panel_user_grace_safe(
                             api,
                             subscription.id,
+                            adopt_short_uuid=subscription.remnawave_short_uuid,
                             **create_kwargs,
                         )
 
-                    if remnawave_user and hasattr(remnawave_user, 'uuid'):
+                    # Идентичность обязана сохраниться: без неё следующий админский
+                    # extend снова уйдёт в create-ветку и наплодит дублей в панели.
+                    if remnawave_user and getattr(remnawave_user, 'id', None):
                         if settings.is_multi_tariff_enabled() and subscription:
-                            subscription.remnawave_uuid = remnawave_user.uuid
+                            subscription.remnawave_id = remnawave_user.id
                         else:
-                            target_user.remnawave_uuid = remnawave_user.uuid
+                            target_user.remnawave_id = remnawave_user.id
                         await db.commit()
 
                 if remnawave_user:
@@ -5234,7 +5276,7 @@ async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user:
         )
 
         try:
-            if callback.bot and target_user.telegram_id:
+            if callback.bot and target_user.telegram_id and settings.is_notifications_enabled():
                 tariff_line = ''
                 if settings.is_multi_tariff_enabled() and getattr(subscription, 'tariff', None):
                     tariff_line = f'\n📦 Тариф: «{subscription.tariff.name}»'
@@ -5364,7 +5406,7 @@ async def admin_buy_tariff_period(callback: types.CallbackQuery, db_user: User, 
     text += f'💰 Баланс: {settings.format_price(target_user.balance_kopeks)}\n\n'
     text += f'📦 <b>Тариф: {html.escape(tariff.name)}</b>\n'
     text += f'📊 Трафик: {traffic}\n'
-    text += f'📱 Устройств: {tariff.device_limit}\n'
+    text += f'📱 Устройств: {Texts.format_device_limit(tariff.device_limit)}\n'
     text += f'🌐 Серверов: {len(tariff.allowed_squads) if tariff.allowed_squads else 0}\n\n'
     text += 'Выберите период:'
 
@@ -5449,7 +5491,7 @@ async def admin_buy_tariff_confirm(callback: types.CallbackQuery, db_user: User,
     text += f'💰 Баланс: {settings.format_price(target_user.balance_kopeks)}\n\n'
     text += f'📦 <b>Тариф: {html.escape(tariff.name)}</b>\n'
     text += f'📊 Трафик: {traffic}\n'
-    text += f'📱 Устройств: {tariff.device_limit}\n'
+    text += f'📱 Устройств: {Texts.format_device_limit(tariff.device_limit)}\n'
     text += f'📅 Период: {period} дней\n'
     text += f'💰 Стоимость: {settings.format_price(price_kopeks)}\n\n'
     text += 'Подтвердить покупку?'
@@ -5622,7 +5664,7 @@ async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User,
             f'👤 {target_user_link} (ID: {target_user_id_display})\n'
             f'📦 Тариф: {html.escape(tariff.name)}\n'
             f'📊 Трафик: {traffic}\n'
-            f'📱 Устройств: {tariff.device_limit}\n'
+            f'📱 Устройств: {Texts.format_device_limit(tariff.device_limit)}\n'
             f'📅 Период: {period} дней\n'
             f'💰 Списано: {settings.format_price(price_kopeks)}\n'
             f'📅 Действует до: {format_datetime(subscription.end_date)}',
@@ -5640,13 +5682,13 @@ async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User,
 
         # Уведомляем пользователя
         try:
-            if callback.bot and target_user.telegram_id:
+            if callback.bot and target_user.telegram_id and settings.is_notifications_enabled():
                 await callback.bot.send_message(
                     chat_id=target_user.telegram_id,
                     text=f'💳 <b>Администратор оформил вам тариф</b>\n\n'
                     f'📦 Тариф: {html.escape(tariff.name)}\n'
                     f'📊 Трафик: {traffic}\n'
-                    f'📱 Устройств: {tariff.device_limit}\n'
+                    f'📱 Устройств: {Texts.format_device_limit(tariff.device_limit)}\n'
                     f'📅 Период: {period} дней\n'
                     f'💰 Списано с баланса: {settings.format_price(price_kopeks)}\n'
                     f'📅 Действует до: {format_datetime(subscription.end_date)}',
@@ -5817,7 +5859,10 @@ async def show_admin_tariff_change(callback: types.CallbackQuery, db_user: User,
         traffic_str = '♾️' if tariff.traffic_limit_gb == 0 else f'{tariff.traffic_limit_gb} ГБ'
         servers_count = len(tariff.allowed_squads) if tariff.allowed_squads else 0
 
-        button_text = f'{prefix}{tariff.name} ({tariff.device_limit} устр., {traffic_str}, {servers_count} серв.)'
+        button_text = (
+            f'{prefix}{tariff.name} ({Texts.format_device_limit(tariff.device_limit)} устр., '
+            f'{traffic_str}, {servers_count} серв.)'
+        )
 
         keyboard.append(
             [
@@ -5886,7 +5931,7 @@ async def select_admin_tariff_change(callback: types.CallbackQuery, db_user: Use
     user_link = user_html_link(user)
     text += f'👤 {user_link}\n\n'
     text += f'<b>Новый тариф:</b> {html.escape(tariff.name)}\n'
-    text += f'• Устройства: {tariff.device_limit}\n'
+    text += f'• Устройства: {Texts.format_device_limit(tariff.device_limit)}\n'
     text += f'• Трафик: {traffic_str}\n'
     text += f'• Серверы: {servers_count}\n\n'
     text += '⚠️ Параметры подписки будут обновлены в соответствии с тарифом.\n'
@@ -6018,7 +6063,7 @@ async def confirm_admin_tariff_change(callback: types.CallbackQuery, db_user: Us
         await callback.message.edit_text(
             f'✅ <b>Тариф успешно изменен</b>\n\n'
             f'Новый тариф: <b>{html.escape(tariff.name)}</b>\n'
-            f'• Устройства: {subscription.device_limit}\n'
+            f'• Устройства: {Texts.format_device_limit(subscription.device_limit)}\n'
             f'• Трафик: {"♾️" if tariff.traffic_limit_gb == 0 else f"{tariff.traffic_limit_gb} ГБ"}\n'
             f'• Серверы: {len(tariff.allowed_squads) if tariff.allowed_squads else 0}',
             reply_markup=types.InlineKeyboardMarkup(

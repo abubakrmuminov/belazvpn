@@ -17,6 +17,7 @@ from app.database.models import (
     Subscription,
     SubscriptionServer,
     SubscriptionStatus,
+    Tariff,
     Transaction,
     TransactionType,
     User,
@@ -456,7 +457,7 @@ async def _convert_trial_subscription_to_paid(
     cabinet (prod report 2026-07). Reusing the trial row keeps the SAME
     Remnawave user/link the user already configured during the trial — the
     callers' "update, don't create" panel sync kicks in automatically because
-    the row carries ``remnawave_uuid``. ``extend_subscription`` does the heavy
+    the row carries ``remnawave_id``. ``extend_subscription`` does the heavy
     lifting: tariff change with TRIAL_ADD_REMAINING_DAYS_TO_PAID carry-over,
     ``is_trial`` reset (+ the ``_converted_from_trial`` marker), traffic/device
     limits, daily flags and deactivation of any other trials.
@@ -713,6 +714,7 @@ async def replace_subscription(
     device_limit: int,
     connected_squads: list[str],
     is_trial: bool,
+    tariff_id: int | None = None,
     autopay_enabled: bool | None = None,
     autopay_days_before: int | None = None,
     update_server_counters: bool = False,
@@ -749,6 +751,8 @@ async def replace_subscription(
     new_autopay_enabled = subscription.autopay_enabled if autopay_enabled is None else autopay_enabled
     new_autopay_days_before = subscription.autopay_days_before if autopay_days_before is None else autopay_days_before
 
+    if tariff_id is not None:
+        subscription.tariff_id = tariff_id
     subscription.status = SubscriptionStatus.ACTIVE.value
     subscription.is_trial = is_trial
     subscription.start_date = current_time
@@ -1366,6 +1370,22 @@ async def extend_subscription(
             except Exception:
                 pass
 
+    # Ручное продление (баланс/промокод/бонусные дни админа) при живой привязке
+    # Lava: двигаем ближайшее автосписание на добавленные дни, иначе Lava спишет
+    # за период, который пользователь уже оплатил другим способом. Наше
+    # собственное рекуррентное списание сюда не заходит — оно продлевает через
+    # метод модели Subscription.extend_subscription.
+    # Только при commit=True: с commit=False вызывающий держит собственную
+    # открытую транзакцию, которая ещё может откатиться — сдвигать дату
+    # списания на стороне Lava до её коммита нельзя (откатить сдвиг нечем).
+    if days > 0 and commit:
+        try:
+            from app.services.payment.lava import shift_lava_next_charge_after_manual_extension
+
+            await shift_lava_next_charge_after_manual_extension(db, subscription.id, days)
+        except Exception as lava_err:  # pragma: no cover - хелпер сам best-effort
+            logger.warning('Failed to shift Lava next charge on extend', error=lava_err)
+
     # Kill other trial subscriptions if this extension converts trial to paid
     if not subscription.is_trial and days > 0:
         try:
@@ -1435,6 +1455,15 @@ async def add_subscription_traffic(db: AsyncSession, subscription: Subscription,
         gb=gb,
         new_expires_at=new_expires_at.strftime('%d.%m.%Y'),
     )
+
+    # В классическом режиме докупленный трафик входит в цену продления
+    # (_calculate_classic_mode передаёт purchased_traffic_gb) — привязка с
+    # прежней суммой её больше не покрывает. В тарифном режиме цена не
+    # меняется, и хелпер молча выйдет по совпадению сумм.
+    from app.services.recurrent_amount import sync_recurrent_bindings_after_price_change
+
+    await sync_recurrent_bindings_after_price_change(db, subscription.id)
+
     return subscription
 
 
@@ -1481,6 +1510,13 @@ async def add_subscription_devices(db: AsyncSession, subscription: Subscription,
     await db.refresh(subscription)
 
     logger.info('📱 К подписке пользователя добавлено устройств', user_id=subscription.user_id, devices=devices)
+
+    # Доп. устройства меняют цену продления — привязка провайдерского
+    # автопродления с прежней суммой перестала её покрывать.
+    from app.services.recurrent_amount import sync_recurrent_bindings_after_price_change
+
+    await sync_recurrent_bindings_after_price_change(db, subscription.id)
+
     return subscription
 
 
@@ -1594,6 +1630,24 @@ async def update_subscription_autopay(
 
     await db.commit()
     await db.refresh(subscription)
+
+    if enabled:
+        # Взаимоисключение движков продления ЦЕНТРАЛИЗОВАНО здесь: включение
+        # balance-autopay отменяет активное СБП-автопродление Platega. Точечные
+        # вызовы на отдельных поверхностях (бот/кабинет) пропускали новые точки
+        # включения (миниапп, админ-тоглы) — и юзер платил дважды за цикл.
+        try:
+            from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+            from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+            await cancel_platega_recurring_for_subscription_safe(db, subscription.id)
+            await cancel_lava_recurring_for_subscription_safe(db, subscription.id)
+        except Exception as platega_error:  # pragma: no cover - хелпер сам best-effort
+            logger.warning(
+                'Не удалось отменить СБП-автопродление при включении автоплатежа',
+                subscription_id=getattr(subscription, 'id', None),
+                error=str(platega_error),
+            )
 
     status = 'включен' if enabled else 'выключен'
     logger.info('💳 Автоплатеж для подписки пользователя', user_id=subscription.user_id, status=status)
@@ -1909,7 +1963,7 @@ async def wipe_trial_subscriptions(db: AsyncSession, subscriptions) -> int:
     панели идут параллельно с ограничением (Semaphore) на ОДНОМ клиенте API (как массовый
     синк) — операция тяжёлая. Подписку, у которой удаление в панели не удалось (транзиент),
     в БД НЕ трогаем (иначе снова orphan + воскрешение) — её подхватит следующий запуск.
-    Чистит устаревший single-tariff `user.remnawave_uuid`. НЕ коммитит — это делает
+    Чистит устаревшую single-tariff панельную идентичность на `User`. НЕ коммитит — это делает
     вызывающий; исключение — когда НИ ОДНО панельное удаление не удалось: тогда в БД
     мутировать нечего и транзакция откатывается, чтобы снять grace-локи pre-delete
     guard'а (не вызывайте с несохранёнными изменениями в сессии). Возвращает число
@@ -1929,6 +1983,7 @@ async def wipe_trial_subscriptions(db: AsyncSession, subscriptions) -> int:
 
     from sqlalchemy import update
 
+    from app.external.remnawave_api import RemnaWaveInvalidUserIdError
     from app.services.subscription_service import SubscriptionService
 
     is_multi = settings.is_multi_tariff_enabled()
@@ -1940,24 +1995,59 @@ async def wipe_trial_subscriptions(db: AsyncSession, subscriptions) -> int:
         async with service.get_api_client() as api:
 
             async def _delete_panel_user(subscription) -> bool:
-                panel_uuid = (
-                    subscription.remnawave_uuid
+                panel_user_id = (
+                    subscription.remnawave_id
                     if is_multi
-                    else (subscription.user.remnawave_uuid if subscription.user else None)
+                    else (subscription.user.remnawave_id if subscription.user else None)
                 )
-                if not panel_uuid:
-                    return True  # в панели нечего удалять
+                if not panel_user_id:
+                    # Отличаем «панельного юзера никогда не было» от «числовой id
+                    # ещё не проставлен бэкфилом». Во втором случае удалить
+                    # локальную строку значит осиротить ЖИВОЙ панельный аккаунт:
+                    # он останется ACTIVE и продолжит занимать лицензию, а связи
+                    # с ботом уже не будет. Отличить может только сама панель —
+                    # гадать нельзя: строка с shortUuid, которого панель не знает,
+                    # иначе блокировала бы сброс триала навсегда (бэкфил такую
+                    # тоже не разрешает — по построению).
+                    stale_short_uuid = (subscription.remnawave_short_uuid or '').strip()
+                    if not stale_short_uuid:
+                        return True  # в панели нечего удалять
+                    async with semaphore:
+                        try:
+                            adopted = await api.get_user_by_short_uuid(stale_short_uuid)
+                        except Exception as error:
+                            logger.error(
+                                'Не удалось проверить short_uuid в панели — триал не сбрасываем',
+                                subscription_id=subscription.id,
+                                remnawave_short_uuid=stale_short_uuid,
+                                error=error,
+                            )
+                            return False
+                    if adopted is None:
+                        return True  # панель этого shortUuid не знает — удалять нечего
+                    panel_user_id = adopted.id
                 async with semaphore:
                     try:
-                        await api.delete_user(panel_uuid)
+                        await api.delete_user(panel_user_id)
                         return True
+                    except RemnaWaveInvalidUserIdError as error:
+                        # Битая ссылка в БД, а не «панель-юзера нет»: удалять по такому
+                        # идентификатору нечего, но и строку сносить нельзя — иначе можно
+                        # осиротить живого панельного юзера. Оставляем на разбор оператору.
+                        logger.error(
+                            'Непригодный идентификатор панель-юзера при сбросе триала',
+                            panel_user_id=panel_user_id,
+                            subscription_id=subscription.id,
+                            error=error,
+                        )
+                        return False
                     except Exception as error:
                         msg = str(error).lower()
                         if 'not found' in msg or 'not exist' in msg:
                             return True  # уже удалён — считаем успехом
                         logger.error(
                             'Не удалось удалить панель-юзера при сбросе триала',
-                            user_uuid=panel_uuid,
+                            panel_user_id=panel_user_id,
                             subscription_id=subscription.id,
                             error=error,
                         )
@@ -1997,11 +2087,13 @@ async def wipe_trial_subscriptions(db: AsyncSession, subscriptions) -> int:
 
     await db.execute(delete(Subscription).where(Subscription.id.in_(subscription_ids)))
 
-    # single-tariff: панель-юзер на уровне пользователя — чистим устаревший uuid, чтобы
-    # синк по нему ничего не восстанавливал.
+    # single-tariff: панель-юзер на уровне пользователя — чистим устаревшую панельную
+    # идентичность, чтобы синк по ней ничего не восстанавливал. Историческую колонку
+    # remnawave_uuid обнуляем заодно: панель-юзера больше нет, и её единственный
+    # оставшийся потребитель — one-shot бэкфил, который иначе попробует её разрезолвить.
     if not is_multi:
         user_ids = list({subscription.user_id for subscription in to_reset})
-        await db.execute(update(User).where(User.id.in_(user_ids)).values(remnawave_uuid=None))
+        await db.execute(update(User).where(User.id.in_(user_ids)).values(remnawave_id=None, remnawave_uuid=None))
 
     return len(to_reset)
 
@@ -2432,6 +2524,59 @@ async def create_pending_subscription(
         payment_method=payment_method,
     )
 
+    return subscription
+
+
+async def create_sbp_pending_subscription(
+    db: AsyncSession,
+    user_id: int,
+    tariff: Tariff,
+) -> Subscription:
+    """Заготовка подписки под СБП-оформление (покупка через Platega-рекуррент).
+
+    Создаётся сразу ИСТЁКШЕЙ (end_date=сейчас): доступ не выдаётся, панель не
+    трогается. Первый CONFIRMED-чардж Platega продлит её по каденсу —
+    ``extend_subscription`` переводит EXPIRED → ACTIVE (PENDING не подошёл бы:
+    его чардж-коллбек не активирует), а синк панели в коллбеке создаст
+    panel-юзера. Если юзер так и не подтвердит привязку в банке — остаётся
+    безвредная истёкшая запись без доступа.
+    """
+    squads = list(tariff.allowed_squads or [])
+    if not squads:
+        # Пустой allowed_squads = «все серверы» — зеркально покупке с баланса
+        # (tariff_purchase.py).
+        from app.database.crud.server_squad import get_all_server_squads
+
+        all_servers, _ = await get_all_server_squads(db, available_only=True)
+        squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
+
+    now = datetime.now(UTC)
+    short_id = await generate_unique_short_id(db)
+    subscription = Subscription(
+        user_id=user_id,
+        status=SubscriptionStatus.EXPIRED.value,
+        is_trial=False,
+        start_date=now,
+        end_date=now,
+        traffic_limit_gb=tariff.traffic_limit_gb,
+        device_limit=tariff.device_limit,
+        connected_squads=squads,
+        tariff_id=tariff.id,
+        autopay_enabled=False,
+        autopay_days_before=settings.DEFAULT_AUTOPAY_DAYS_BEFORE,
+        remnawave_short_id=short_id,
+    )
+
+    db.add(subscription)
+    await db.commit()
+    await db.refresh(subscription)
+
+    logger.info(
+        '⚡ Создана СБП-заготовка подписки (активируется первым списанием)',
+        user_id=user_id,
+        subscription_id=subscription.id,
+        tariff_id=tariff.id,
+    )
     return subscription
 
 

@@ -97,25 +97,36 @@ class PaymentCommonMixin:
 
         # Если для пользователя есть незавершённый checkout, предлагаем вернуться к нему.
         if user:
+            cart_data = None
             try:
-                has_saved_cart = await user_cart_service.has_user_cart(user.id)
+                cart_data = await user_cart_service.get_user_cart(user.id)
             except Exception as cart_error:
                 logger.warning(
                     'Не удалось проверить наличие сохраненной корзины у пользователя',
                     user_id=user.id,
                     cart_error=cart_error,
                 )
-                has_saved_cart = False
 
-            if has_saved_cart:
-                keyboard_rows.append(
-                    [
-                        build_miniapp_or_callback_button(
-                            text=texts.RETURN_TO_SUBSCRIPTION_CHECKOUT,
-                            callback_data='return_to_saved_cart',
-                        )
-                    ]
-                )
+            if cart_data:
+                cart_mode = cart_data.get('cart_mode')
+                if cart_mode == 'gift_purchase':
+                    keyboard_rows.append(
+                        [
+                            build_miniapp_or_callback_button(
+                                text=texts.t('GIFT_RETURN_TO_CART_BUTTON', '🎁 Вернуться к подарку'),
+                                callback_data='return_to_gift_cart',
+                            )
+                        ]
+                    )
+                else:
+                    keyboard_rows.append(
+                        [
+                            build_miniapp_or_callback_button(
+                                text=texts.RETURN_TO_SUBSCRIPTION_CHECKOUT,
+                                callback_data='return_to_saved_cart',
+                            )
+                        ]
+                    )
             else:
                 draft_exists = await has_subscription_checkout_draft(user.id)
                 if should_offer_checkout_resume(user, draft_exists, subscription=subscription):
@@ -161,6 +172,9 @@ class PaymentCommonMixin:
         payment_method_title: str | None = None,
     ) -> None:
         """Отправляет пользователю уведомление об успешном платеже."""
+        if not settings.is_notifications_enabled():
+            return
+
         # Lazy import to avoid circular dependency
         from app.cabinet.routes.websocket import notify_user_balance_topup
 
@@ -360,19 +374,26 @@ async def send_cart_notification_after_topup(
     amount_kopeks: int,
     db: AsyncSession,
     bot: Any | None,
+    *,
+    notify_email: bool = True,
 ) -> bool:
     """Run post-topup side-effects: resume daily / auto-purchase saved cart / auto-extend.
 
     Возвращает False всегда (имя оставлено ради 19+ существующих вызовов).
     Само сообщение «Баланс пополнен…» больше не шлётся — оно дублировало
     основное «Пополнение успешно!» и ломало MAIN_MENU_MODE=cabinet.
+
+    ``notify_email=False`` — вызывающий уже уведомил юзера сам и хочет только
+    авто-действия (ручное пополнение с выключенным уведомлением). Провайдеры
+    оставляют значение по умолчанию.
     """
     # Единственная общая точка после зачисления во ВСЕХ провайдерах — поэтому
     # email/WS-канал для юзеров без Telegram подключён здесь, а не в 18+
     # webhook-обработчиках. Уходит до автопокупки, чтобы уведомления пришли в
     # хронологическом порядке «пополнение → подписка» (#2952). Для
     # telegram-юзеров это no-op — им сообщение уже отправил провайдер.
-    await notify_email_user_topup(user, amount_kopeks)
+    if notify_email:
+        await notify_email_user_topup(user, amount_kopeks)
 
     from app.services.subscription_auto_purchase_service import (
         auto_purchase_saved_cart_after_topup,
@@ -491,7 +512,7 @@ async def try_fulfill_guest_purchase(
                 'Webhook amount does not match guest purchase amount',
                 webhook_kopeks=payment_amount_kopeks,
                 purchase_kopeks=existing.amount_kopeks,
-                purchase_token_prefix=purchase_token[:5],
+                purchase_id=existing.id,
                 provider=provider_name,
             )
             await update_purchase_status(db, purchase_token, GuestPurchaseStatus.FAILED)
@@ -514,7 +535,7 @@ async def try_fulfill_guest_purchase(
         ):
             logger.info(
                 'Guest purchase already in terminal state, skipping',
-                purchase_token_prefix=purchase_token[:5],
+                purchase_id=existing.id,
                 status=existing.status,
                 provider=provider_name,
             )
@@ -540,7 +561,7 @@ async def try_fulfill_guest_purchase(
             await db.commit()
             logger.info(
                 'Gift marked as PAID, deferred until claim',
-                purchase_token_prefix=purchase_token[:5],
+                purchase_id=existing.id,
                 provider=provider_name,
             )
             # NaloGO receipt: payment received, fulfillment deferred until code activation
@@ -553,13 +574,13 @@ async def try_fulfill_guest_purchase(
                 else:
                     logger.warning(
                         'Code-only gift has no buyer, skipping NaloGO receipt',
-                        purchase_token_prefix=purchase_token[:5],
+                        purchase_id=existing.id,
                         buyer_user_id=existing.buyer_user_id,
                     )
             except Exception:
                 logger.exception(
                     'Failed to create NaloGO receipt for code-only gift',
-                    purchase_token_prefix=purchase_token[:5],
+                    purchase_id=existing.id,
                 )
             # Best-effort: send the claim link to the recipient (if email) and a
             # durable backstop copy to the buyer. Never blocks the payment flow.
@@ -576,7 +597,7 @@ async def try_fulfill_guest_purchase(
             except Exception:
                 logger.warning(
                     'Failed to send gift claim notification',
-                    purchase_token_prefix=purchase_token[:5],
+                    purchase_id=existing.id,
                 )
             return True
 
@@ -586,7 +607,7 @@ async def try_fulfill_guest_purchase(
         logger.info(
             'Guest purchase fulfilled',
             provider_payment_id=provider_payment_id,
-            purchase_token_prefix=purchase_token[:5],
+            purchase_id=existing.id if existing else None,
             provider=provider_name,
         )
         return True

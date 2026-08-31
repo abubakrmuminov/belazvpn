@@ -17,6 +17,7 @@ from app.database.models import (
     SubscriptionStatus,
     User,
 )
+from app.localization.texts import Texts
 from app.utils.decorators import admin_required, error_handler
 from app.utils.formatters import format_datetime
 
@@ -144,8 +145,8 @@ async def show_subscriptions_list(callback: types.CallbackQuery, db_user: User, 
 
             text += f'{i}. {sub_type} {user_info}\n'
             text += f'   {status} | До: {format_datetime(sub.end_date)}\n'
-            if sub.device_limit > 0:
-                text += f'   📱 Устройств: {sub.device_limit}\n'
+            if sub.device_limit is not None:
+                text += f'   📱 Устройств: {Texts.format_device_limit(sub.device_limit)}\n'
             text += '\n'
 
     keyboard = []
@@ -379,6 +380,11 @@ async def send_expiry_reminders(callback: types.CallbackQuery, db_user: User, db
                 # Skip email-only users (no telegram_id)
                 if not user.telegram_id:
                     logger.debug('Пропуск email-пользователя при отправке напоминания', user_id=user.id)
+                    continue
+
+                from app.utils.notification_prefs import is_subscription_expiry_enabled
+
+                if not settings.is_notifications_enabled() or not is_subscription_expiry_enabled(user):
                     continue
 
                 days_left = max(1, subscription.days_left)

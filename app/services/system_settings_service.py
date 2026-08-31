@@ -1,7 +1,8 @@
 import hashlib
 import json
+import os
 from dataclasses import dataclass
-from typing import Any, Optional, Union, get_args, get_origin
+from typing import Any, ClassVar, Optional, Union, get_args, get_origin
 
 import structlog
 from sqlalchemy import select
@@ -68,6 +69,12 @@ class ReadOnlySettingError(RuntimeError):
 
 
 class BotConfigurationService:
+    # Ключи, удалённые в ходе миграций. Строки в system_settings остаются, но
+    # больше ни на что не влияют — молчать об этом нельзя.
+    _RETIRED_SETTINGS: ClassVar[dict[str, str]] = {
+        'TRAFFIC_EXCLUDED_USER_UUIDS': 'TRAFFIC_EXCLUDED_USER_IDS (значения — числовые id панели, не UUID)',
+    }
+
     # SECURITY: keys that must NEVER be editable through the settings API. Beyond
     # the bot token, this covers admin IDENTITY and core AUTH secrets — a
     # delegated admin holding only `settings:edit` could otherwise add their own
@@ -124,6 +131,7 @@ class BotConfigurationService:
     CATEGORY_TITLES: dict[str, str] = {
         'CORE': '🤖 Основные настройки',
         'SUPPORT': '💬 Поддержка и тикеты',
+        'REGISTRATION_ACCESS': '🔐 Регистрация и доступ',
         'LOCALIZATION': '🌍 Языки интерфейса',
         'CHANNEL': '📣 Обязательная подписка',
         'TIMEZONE': '🗂 Timezone',
@@ -193,11 +201,13 @@ class BotConfigurationService:
         'MODERATION': '🛡️ Модерация и фильтры',
         'BAN_NOTIFICATIONS': '🚫 Тексты уведомлений о блокировках',
         'INFO_PAGES': '📄 Инфо-страницы',
+        'GRACE_ACCESS': '🛟 Grace-доступ',
     }
 
     CATEGORY_DESCRIPTIONS: dict[str, str] = {
         'CORE': 'Базовые параметры работы бота и обязательные ссылки.',
         'SUPPORT': 'Контакты поддержки, SLA и режимы обработки обращений.',
+        'REGISTRATION_ACCESS': 'Закрытая регистрация и допустимые способы приглашения новых пользователей.',
         'LOCALIZATION': 'Доступные языки, локализация интерфейса и выбор языка.',
         'CHANNEL': 'Настройки обязательной подписки на канал или группу.',
         'TIMEZONE': 'Часовой пояс панели и отображение времени.',
@@ -266,6 +276,11 @@ class BotConfigurationService:
         'MODERATION': 'Настройки фильтров отображаемых имен и защиты от фишинга.',
         'BAN_NOTIFICATIONS': 'Тексты уведомлений о блокировках, которые отправляются пользователям.',
         'INFO_PAGES': 'Видимость встроенных страниц (правила, политика, оферта, FAQ) в боте и веб-кабинете.',
+        'GRACE_ACCESS': (
+            'Временный ограниченный доступ для истёкших и лимитных подписок. '
+            'Здесь ключи лежат по отдельности; связанный экран с проверкой конфигурации и состоянием '
+            'сессий — в админке кабинета, раздел «Grace-доступ».'
+        ),
     }
 
     @staticmethod
@@ -284,6 +299,8 @@ class BotConfigurationService:
         'LOCALES_PATH': 'LOCALIZATION',
         'CHANNEL_IS_REQUIRED_SUB': 'CHANNEL',
         'BOT_USERNAME': 'CORE',
+        'INVITE_ONLY_ENABLED': 'REGISTRATION_ACCESS',
+        'INVITE_ONLY_ALLOW_GIFT_LINKS': 'REGISTRATION_ACCESS',
         'DEFAULT_LANGUAGE': 'LOCALIZATION',
         'AVAILABLE_LANGUAGES': 'LOCALIZATION',
         'REMNAWAVE_WEBHOOK_NOTIFY_NODE_CONNECTION_STATUS': 'ADMIN_NOTIFICATIONS',
@@ -291,6 +308,10 @@ class BotConfigurationService:
         'DEFAULT_DEVICE_LIMIT': 'SUBSCRIPTIONS_CORE',
         'DEFAULT_TRAFFIC_LIMIT_GB': 'SUBSCRIPTIONS_CORE',
         'MAX_DEVICES_LIMIT': 'SUBSCRIPTIONS_CORE',
+        # Без явной привязки ключ уехал бы в автокатегорию «ALLOW» (категория берётся
+        # из первого слова), где его никто не найдёт: искать его будут рядом с
+        # MAX_DEVICES_LIMIT и PRICE_PER_DEVICE.
+        'ALLOW_DEVICES_BELOW_TARIFF_LIMIT': 'SUBSCRIPTIONS_CORE',
         'PRICE_PER_DEVICE': 'SUBSCRIPTIONS_CORE',
         'DEVICES_SELECTION_ENABLED': 'SUBSCRIPTIONS_CORE',
         'DEVICES_SELECTION_DISABLED_AMOUNT': 'SUBSCRIPTIONS_CORE',
@@ -357,6 +378,17 @@ class BotConfigurationService:
         'SIMPLE_SUBSCRIPTION_TRAFFIC_GB': 'SIMPLE_SUBSCRIPTION',
         'SIMPLE_SUBSCRIPTION_SQUAD_UUID': 'SIMPLE_SUBSCRIPTION',
         'SUPPORT_TOPUP_ENABLED': 'PAYMENT',
+        # Ключи, начинающиеся с глагола, без явной привязки создают бессмысленную
+        # автокатегорию по первому слову («ACTIVATE», «BUY», «LOW»…), и настройка
+        # теряется: в такой раздел оператор не пойдёт.
+        'ACTIVATE_BUTTON_VISIBLE': 'CONNECT_BUTTON',
+        'ACTIVATE_BUTTON_TEXT': 'CONNECT_BUTTON',
+        'BUY_TRAFFIC_BUTTON_VISIBLE': 'INTERFACE',
+        'DISABLE_WEB_PAGE_PREVIEW': 'INTERFACE',
+        'ENABLE_AUTOPAY': 'AUTOPAY',
+        'DEFAULT_AUTOPAY_PERIOD_DAYS': 'AUTOPAY',
+        'RESET_DEVICES_ON_RENEWAL': 'SUBSCRIPTIONS_CORE',
+        'LOW_BALANCE_ALERT_EXPIRY_DAYS': 'NOTIFICATIONS',
         'ENABLE_NOTIFICATIONS': 'NOTIFICATIONS',
         'NOTIFICATION_RETRY_ATTEMPTS': 'NOTIFICATIONS',
         'NOTIFICATION_CACHE_HOURS': 'NOTIFICATIONS',
@@ -373,7 +405,7 @@ class BotConfigurationService:
         'TRAFFIC_DAILY_CHECK_TIME': 'MONITORING',
         'TRAFFIC_DAILY_THRESHOLD_GB': 'MONITORING',
         'TRAFFIC_IGNORED_NODES': 'MONITORING',
-        'TRAFFIC_EXCLUDED_USER_UUIDS': 'MONITORING',
+        'TRAFFIC_EXCLUDED_USER_IDS': 'MONITORING',
         'TRAFFIC_NOTIFICATION_COOLDOWN_MINUTES': 'MONITORING',
         'SUSPICIOUS_NOTIFICATIONS_TOPIC_ID': 'MONITORING',
         'TRAFFIC_CHECK_BATCH_SIZE': 'MONITORING',
@@ -386,6 +418,8 @@ class BotConfigurationService:
         'MAIN_MENU_RICH_EFFECT_ID': 'INTERFACE',
         'MAIN_MENU_RICH_LOGO_URL': 'INTERFACE',
         'MAIN_MENU_RICH_SUBSCRIPTIONS_COLLAPSIBLE': 'INTERFACE',
+        'MAIN_MENU_RICH_INLINE_BUTTONS': 'INTERFACE',
+        'USER_NOTIFICATIONS_RICH_ENABLED': 'INTERFACE',
         'USER_ACTION_LOG_ENABLED': 'MONITORING',
         'USER_ACTION_LOG_RETENTION_DAYS': 'MONITORING',
         'CABINET_BUTTON_STYLE': 'INTERFACE',
@@ -481,9 +515,32 @@ class BotConfigurationService:
         'DEBUG': 'DEBUG',
         'DISPLAY_NAME_': 'MODERATION',
         'BAN_MSG_': 'BAN_NOTIFICATIONS',
+        'GRACE_ACCESS_': 'GRACE_ACCESS',
     }
 
     CHOICES: dict[str, list[ChoiceOption]] = {
+        'GRACE_ACCESS_MODE': [
+            ChoiceOption('false', '⛔️ Выключен', 'Grace-сессии не выдаются и не завершаются'),
+            ChoiceOption('observe', '👀 Наблюдение', 'Кандидаты только логируются, панель не меняется'),
+            ChoiceOption('true', '🛟 Включён', 'Выдаёт и завершает grace-доступ'),
+            ChoiceOption('drain', '🚰 Слив', 'Новых сессий нет, открытые доводятся до конца'),
+        ],
+        'REFERRAL_REWARD_SCHEME': [
+            ChoiceOption('legacy', '💰 Классическая', 'Проценты и фиксированные бонусы из настроек REFERRAL_*'),
+            ChoiceOption('levels', '🪜 Многоуровневая', 'Уровни с деньгами и/или днями подписки'),
+        ],
+        'REFERRAL_ALLOW_DAYS_TARGET_CHOICE': [
+            ChoiceOption('true', '✅ Разрешено', 'Пользователь сам выбирает подписку для дней награды'),
+            ChoiceOption('false', '⛔️ Запрещено', 'Подписку подбирает бот — платную с самым поздним сроком'),
+        ],
+        'REFERRAL_ALLOW_REWARD_KIND_CHOICE': [
+            ChoiceOption('true', '✅ Разрешено', 'Пользователь выбирает: деньги или дни, когда правило даёт оба'),
+            ChoiceOption('false', '⛔️ Запрещено', 'Выдаётся всё, что настроено правилом'),
+        ],
+        'REFERRAL_LEVELS_MODE': [
+            ChoiceOption('chain', '🔗 Цепочка', 'Уровень = глубина: платят и пригласившему, и тем, кто выше'),
+            ChoiceOption('tiers', '🏅 Ранги', 'Уровень = ранг за число рефералов: платят только прямому пригласившему'),
+        ],
         'DATABASE_MODE': [
             ChoiceOption('auto', '🤖 Авто'),
             ChoiceOption('postgresql', '🐘 PostgreSQL'),
@@ -628,6 +685,49 @@ class BotConfigurationService:
     }
 
     SETTING_HINTS: dict[str, dict[str, str]] = {
+        'GRACE_ACCESS_MODE': {
+            'description': (
+                'Режим grace-доступа: временного ограниченного VPN-доступа для истёкшей или упёршейся '
+                'в лимит подписки, чтобы человек успел продлить её.'
+            ),
+            'format': 'false — выключен, observe — только журнал, true — включён, drain — доводит открытые сессии.',
+            'example': 'false',
+            'warning': (
+                'Режим читается один раз при старте бота — сохранённое значение начнёт действовать только '
+                'после перезапуска. С true и незаполненными сквадами бот запустится с выключенным grace.'
+            ),
+            'dependencies': 'GRACE_ACCESS_EXPIRED_SQUAD_UUID, GRACE_ACCESS_LIMITED_SQUAD_UUID, GRACE_ACCESS_TRAFFIC_GB',
+        },
+        'GRACE_ACCESS_EXPIRED_SQUAD_UUID': {
+            'description': 'Сквад, в который переводится пользователь с истёкшей подпиской на время grace-доступа.',
+            'format': 'UUID сквада из панели RemnaWave.',
+            'example': '3fa85f64-5717-4562-b3fc-2c963f66afa6',
+            'warning': 'Обязателен при режиме true. Пустое или некорректное значение отключает grace при старте.',
+        },
+        'GRACE_ACCESS_LIMITED_SQUAD_UUID': {
+            'description': 'Сквад для подписки, упёршейся в лимит трафика, на время grace-доступа.',
+            'format': 'UUID сквада из панели RemnaWave.',
+            'example': '3fa85f64-5717-4562-b3fc-2c963f66afa6',
+            'warning': 'Обязателен при режиме true. Пустое или некорректное значение отключает grace при старте.',
+        },
+        'GRACE_ACCESS_EXTERNAL_SQUAD_UUID': {
+            'description': 'Что делать с внешним сквадом пользователя на время grace-доступа.',
+            'format': 'Пусто — отцепить, keep — оставить как есть, либо UUID аварийного сквада.',
+            'example': 'keep',
+            'warning': 'Исходное состояние сохраняется в снимке сессии и возвращается при завершении grace.',
+        },
+        'GRACE_ACCESS_TRAFFIC_GB': {
+            'description': 'Лимит трафика, который выдаётся на время grace-доступа.',
+            'format': 'Целое число гигабайт.',
+            'example': '1',
+            'warning': 'При режиме true должно быть не меньше 1, иначе grace выключится при старте.',
+        },
+        'GRACE_ACCESS_DURATION_HOURS': {
+            'description': 'Сколько действует grace-доступ, если подписку так и не продлили.',
+            'format': 'Целое число часов.',
+            'example': '72',
+            'warning': 'По истечении срока панельное состояние возвращается к исходному из снимка сессии.',
+        },
         'SALES_MODE': {
             'description': (
                 'Режим продажи подписок. '
@@ -747,6 +847,36 @@ class BotConfigurationService:
             'example': 'true',
             'warning': 'Действует только при MAIN_MENU_RICH_ENABLED и включённом мультитарифе.',
             'dependencies': 'MAIN_MENU_RICH_ENABLED, MULTI_TARIFF_ENABLED',
+        },
+        'MAIN_MENU_RICH_INLINE_BUTTONS': {
+            'description': (
+                'Показывать кнопки ВНУТРИ полотна rich-сообщения (Bot API 10.3), а не отдельной '
+                'клавиатурой под ним. Действует и в главном меню, и в rich-уведомлениях админ-чата. '
+                'Клавиатура не дублируется: кнопки либо внутри, либо под сообщением.'
+            ),
+            'format': 'Булево значение.',
+            'example': 'false',
+            'warning': (
+                'Требует Bot API 10.3 на сервере. Если хотя бы одну кнопку сообщения нельзя '
+                'перенести (оплата, игра, а в групповом админ-чате — Mini App), клавиатура этого '
+                'сообщения целиком остаётся под ним: половина кнопок внутри — это потерянные кнопки.'
+            ),
+            'dependencies': 'MAIN_MENU_RICH_ENABLED, ADMIN_NOTIFICATIONS_RICH_ENABLED',
+        },
+        'USER_NOTIFICATIONS_RICH_ENABLED': {
+            'description': (
+                'Отправлять пользовательские уведомления (истечение подписки, автоплатёж, баланс, '
+                'рефералы, выплаты) rich-сообщением, как главное меню, а не обычным текстом. '
+                'Кнопки переезжают внутрь полотна, если включено MAIN_MENU_RICH_INLINE_BUTTONS.'
+            ),
+            'format': 'Булево значение.',
+            'example': 'true',
+            'warning': (
+                'Действует только при MAIN_MENU_RICH_ENABLED. Уведомления со сложной разметкой '
+                '(цитаты, списки, блоки кода) и уведомления мониторинга с логотипом уходят '
+                'классическим сообщением: rich-разметка их не воспроизводит дословно.'
+            ),
+            'dependencies': 'MAIN_MENU_RICH_ENABLED, MAIN_MENU_RICH_INLINE_BUTTONS',
         },
         'USER_ACTION_LOG_ENABLED': {
             'description': (
@@ -1227,7 +1357,9 @@ class BotConfigurationService:
         if isinstance(value, bool):
             return None
         upper_key = key.upper()
-        if any(suffix in upper_key for suffix in ('PRICE', '_KOPEKS', 'AMOUNT')):
+        # Денежные ключи содержат PRICE или оканчиваются на _KOPEKS; голое AMOUNT
+        # не признак цены (DEVICES_SELECTION_DISABLED_AMOUNT — количество устройств).
+        if any(suffix in upper_key for suffix in ('PRICE', '_KOPEKS')):
             try:
                 return settings.format_price(int(value))
             except Exception:
@@ -1493,6 +1625,33 @@ class BotConfigurationService:
             return formatted
         return _truncate(formatted)
 
+    @staticmethod
+    def as_choice_key(value: Any) -> str:
+        """Значение в том виде, в котором его можно сравнить с ``ChoiceOption.value``.
+
+        Варианты всегда описаны СТРОКАМИ, а значение приходит уже приведённым к
+        типу настройки: у булевой это ``True``/``False``, у числовой — ``int``.
+        Прямое сравнение с ``'true'`` не совпадает никогда, и настройка с
+        вариантами становится несохраняемой — PUT отвечает 400 на любое значение,
+        включая перечисленные в самих вариантах.
+
+        Отдельной ветки для булевых не нужно: ``str(True).lower()`` и так даёт
+        ``'true'``. Числа при этом не сливаются с ними — ``1`` остаётся ``'1'``.
+        """
+        return str(value).strip().lower()
+
+    @classmethod
+    def value_matches_choice(cls, key: str, value: Any) -> bool:
+        """Допустимо ли значение для настройки с перечисленными вариантами.
+
+        Настройка без вариантов принимает что угодно: ограничение задаётся
+        именно списком, а не самим фактом проверки.
+        """
+        options = cls.get_choice_options(key)
+        if not options:
+            return True
+        return cls.as_choice_key(value) in {cls.as_choice_key(option.value) for option in options}
+
     @classmethod
     def get_choice_options(cls, key: str) -> list[ChoiceOption]:
         cls.initialize_definitions()
@@ -1742,17 +1901,47 @@ class BotConfigurationService:
         return ''.join(reversed(result))
 
     @classmethod
-    async def initialize(cls) -> None:
+    async def initialize(cls, *, sync_web_api_token: bool = True) -> None:
+        """Загрузить настройки из БД в память.
+
+        `sync_web_api_token=False` — для одноразовых CLI: им нужны только
+        значения, а бутстрап токена веб-API пишет в БД, и холостой прогон
+        (который обещает «ничего не записано») перестал бы быть холостым.
+        """
         cls.initialize_definitions()
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(select(SystemSetting))
             rows = result.scalars().all()
 
+        # Тот же ключ мог остаться и в .env — pydantic-settings его молча
+        # игнорирует (`extra='ignore'`), и это как раз тот канал, которым
+        # пользуется большинство инсталляций: снятая переменная была
+        # задокументирована в .env.example.
+        for retired_key, replacement in cls._RETIRED_SETTINGS.items():
+            if (os.environ.get(retired_key) or '').strip():
+                logger.warning(
+                    'Переменная окружения больше не поддерживается и НЕ применена',
+                    key=retired_key,
+                    replacement=replacement,
+                )
+
         overrides: dict[str, str | None] = {}
         for row in rows:
             if row.key in cls._definitions:
                 overrides[row.key] = row.value
+            elif row.key in cls._RETIRED_SETTINGS and (row.value or '').strip():
+                # Строка настройки осталась от прежней версии и молча игнорируется —
+                # оператор считает, что настройка действует, а её нет. Для
+                # TRAFFIC_EXCLUDED_USER_UUIDS это особенно больно: список хранил
+                # UUID панельных юзеров, которых в 3.0.0 не существует, поэтому
+                # автоматически сконвертировать значения нельзя — нужно, чтобы
+                # человек заполнил новый ключ заново.
+                logger.warning(
+                    'Настройка из БД больше не поддерживается и НЕ применена',
+                    key=row.key,
+                    replacement=cls._RETIRED_SETTINGS[row.key],
+                )
 
         for key, raw_value in overrides.items():
             if cls._is_env_override(key):
@@ -1767,7 +1956,8 @@ class BotConfigurationService:
             cls._overrides_raw[key] = raw_value
             cls._apply_to_settings(key, parsed_value)
 
-        await cls._sync_default_web_api_token()
+        if sync_web_api_token:
+            await cls._sync_default_web_api_token()
 
         # После загрузки всех overrides (включая SALES_MODE) — пересчитать цены,
         # т.к. ensure_tariffs_synced мог загрузить тарифные цены до того как
