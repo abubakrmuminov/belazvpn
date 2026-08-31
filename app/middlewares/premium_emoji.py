@@ -98,7 +98,10 @@ class PremiumEmojiMiddleware(BaseRequestMiddleware):
 
         self._load_emojis()
 
-        # По умолчанию aiogram 3 использует HTML, если parse_mode не задан явно
+        # Умолчания aiogram 3 используют Default object
+        if parse_mode is not None and not isinstance(parse_mode, str):
+            parse_mode = str(getattr(parse_mode, 'value', 'html')) if hasattr(parse_mode, 'value') else 'html'
+            
         mode = (parse_mode or 'html').lower()
         if 'html' in mode:
             return self._replace_html(text)
